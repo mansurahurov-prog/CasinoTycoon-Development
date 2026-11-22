@@ -290,7 +290,7 @@ local function resetReceptionLabel(state)
 end
 
 local function flashReceptionLabel(state, text, color, seconds)
-	if state.served then
+	if state.served or state.leaving then
 		return
 	end
 	state.label.Text = text
@@ -298,7 +298,8 @@ local function flashReceptionLabel(state, text, color, seconds)
 	local token = {}
 	state.token = token
 	task.delay(seconds, function()
-		if state.token == token and not state.served then
+		if state.token == token and not state.served and not state.leaving
+			and state.label.Parent then
 			resetReceptionLabel(state)
 		end
 	end)
@@ -314,7 +315,7 @@ local function runReceptionVisit()
 	guest:SetAttribute("GuestKind", "Reception")
 	guest:SetAttribute("Served", false)
 	local label = addGuestBadge(head, "HOTEL GUEST", 70)
-	guest:PivotTo(CFrame.new(geometry.spawnPoint))
+	guest:PivotTo(CFrame.lookAt(geometry.spawnPoint, geometry.spawnPoint + Vector3.new(0, 0, 1)))
 	guest.Parent = guestsFolder
 
 	local state = { served = false, leaving = false, label = label }
@@ -336,7 +337,11 @@ local function runReceptionVisit()
 			if state.served or state.leaving or not guest.Parent then
 				return
 			end
-			if player.Parent ~= Players or player:GetAttribute("CashLoaded") ~= true then
+			if player.Parent ~= Players then
+				return
+			end
+			if player:GetAttribute("CashLoaded") ~= true then
+				flashReceptionLabel(state, "PROFILE LOADING - TRY AGAIN", Color3.fromRGB(240, 190, 120), 2)
 				return
 			end
 			local stats = player:FindFirstChild("leaderstats")
@@ -364,9 +369,15 @@ local function runReceptionVisit()
 			prompt:Destroy()
 			cash.Value = math.min(RECEPTION_AWARD_CAP, cash.Value + RECEPTION_REWARD)
 			receptionCooldown[player] = os.clock() + RECEPTION_COOLDOWN
+			-- Same-frame attribute writes can be coalesced before replication, so the
+			-- HUD toast would not fire on a repeat check-in. Reset now, raise later.
 			player:SetAttribute("LastGuestReward", 0)
 			player:SetAttribute("LastGuestService", "HOTEL CHECK-IN")
-			player:SetAttribute("LastGuestReward", RECEPTION_REWARD)
+			task.delay(0.1, function()
+				if player.Parent == Players then
+					player:SetAttribute("LastGuestReward", RECEPTION_REWARD)
+				end
+			end)
 			state.label.Text = "+$" .. tostring(RECEPTION_REWARD) .. " | CHECK-IN COMPLETE"
 			state.label.TextColor3 = Color3.fromRGB(154, 226, 177)
 		end)
