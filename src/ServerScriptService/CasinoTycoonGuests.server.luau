@@ -229,24 +229,94 @@ task.spawn(function()
 	end
 end)
 
--- Front desk: interactive one-shot check-in cycle.
--- One reception guest walks into the lobby and waits at the counter. Any player
--- with loaded cash can serve the guest once through a ProximityPrompt. The guest
--- is never re-servable: the prompt is destroyed and the served flag is latched
--- before the reward is applied.
+-- Front desk: hotel service queue (v1).
+-- Three guest types, four request types, a three-slot queue in front of the
+-- lobby desk, a patience timer with live visual feedback, type/quality-scaled
+-- rewards and a per-player desk upgrade (DeskLevel 0-3) persisted through
+-- CasinoTycoonData. Every payout is latched before it is credited, so a guest
+-- can never be served twice. The plot guest loop above is untouched.
+local ServerScriptService = game:GetService("ServerScriptService")
+
 local RECEPTION_FIRST_DELAY = 14
-local RECEPTION_INTERVAL = 35
-local RECEPTION_JITTER = 10
-local RECEPTION_REWARD = 60
-local RECEPTION_COOLDOWN = 30
-local RECEPTION_PATIENCE = 90
+local RECEPTION_INTERVAL = 16
+local RECEPTION_JITTER = 8
+local RECEPTION_RETRY = 6
 local RECEPTION_MAX_DISTANCE = 18
 local RECEPTION_AWARD_CAP = 1000000000
+local RECEPTION_TRIGGER_COOLDOWN = 1
+local QUEUE_TICK = 0.25
 
-local receptionCooldown = {}
-local receptionBusy = false
+local QUEUE_OFFSETS = { -6, 0, 6 }
+local QUEUE_SIZE = #QUEUE_OFFSETS
+
+local GUEST_TYPES = {
+	{
+		id = "Regular",
+		label = "GUEST",
+		hold = 0.8,
+		patience = 45,
+		multiplier = 1,
+		color = Color3.fromRGB(235, 197, 111),
+	},
+	{
+		id = "VIP",
+		label = "VIP GUEST",
+		hold = 1,
+		patience = 32,
+		multiplier = 1.35,
+		color = Color3.fromRGB(246, 214, 120),
+	},
+	{
+		id = "Demanding",
+		label = "DEMANDING",
+		hold = 1.4,
+		patience = 22,
+		multiplier = 1.2,
+		color = Color3.fromRGB(238, 150, 120),
+	},
+}
+
+local REQUESTS = {
+	{ id = "CHECK_IN", text = "CHECK IN", base = 60 },
+	{ id = "RESTAURANT", text = "RESTAURANT", base = 80 },
+	{ id = "SPA", text = "SPA", base = 110 },
+	{ id = "VIP_CONCIERGE", text = "VIP CONCIERGE", base = 150 },
+}
+
+local DESK_MAX_LEVEL = 3
+local DESK_COSTS = { 400, 1200, 3000 }
+local DESK_INCOME_PER_LEVEL = 0.15
+local DESK_SPEED_PER_LEVEL = 0.15
+local DESK_MAX_DISTANCE = 14
+
 local receptionGeometry
 local receptionWarned = false
+
+-- CasinoTycoonData owns persistence; the guest script only reads/writes the
+-- DeskLevel field through it. If the module is unavailable (partial place
+-- load) the desk falls back to the player attribute for the current session.
+local Data
+do
+	local dataModule = ServerScriptService:FindFirstChild("CasinoTycoonData")
+	if dataModule and dataModule:IsA("ModuleScript") then
+		local ok, result = pcall(require, dataModule)
+		if ok and type(result) == "table" then
+			Data = result
+		else
+			warn("CasinoTycoonGuests: CasinoTycoonData unavailable - desk level is session-only")
+		end
+	end
+end
+
+local function deskLevelOf(player)
+	if Data and Data.GetDeskLevel then
+		local level = Data.GetDeskLevel(player)
+		if level then
+			return level
+		end
+	end
+	return math.clamp(tonumber(player:GetAttribute("DeskLevel")) or 0, 0, DESK_MAX_LEVEL)
+end
 
 local function warnReceptionOnce(message)
 	if receptionWarned then
@@ -280,163 +350,597 @@ local function getReceptionGeometry()
 		midPoint = Vector3.new(x, floorY, spawnZ + (standZ - spawnZ) * 0.45),
 		spawnPoint = Vector3.new(x, floorY + 3.1, spawnZ),
 		exitPoint = Vector3.new(x, floorY, spawnZ - 1.5),
+		lobby = lobby,
 	}
 	return receptionGeometry
 end
 
-local function resetReceptionLabel(state)
-	state.label.Text = "HOTEL GUEST"
-	state.label.TextColor3 = Color3.fromRGB(235, 197, 111)
+local receptionQueue = {}
+local serveCooldown = {}
+local upgradeCooldown = {}
+local deskStation
+local stationToken
+
+local function queueIndexOf(state)
+	for index, candidate in ipairs(receptionQueue) do
+		if candidate == state then
+			return index
+		end
+	end
+	return nil
 end
 
-local function flashReceptionLabel(state, text, color, seconds)
+local function queueSlotPoint(geometry, index)
+	local offset = QUEUE_OFFSETS[math.clamp(index, 1, QUEUE_SIZE)] or 0
+	return Vector3.new(geometry.standPoint.X + offset, geometry.floorY, geometry.standPoint.Z)
+end
+
+local function createServiceBadge(head, guestType)
+	local badge = Instance.new("BillboardGui")
+	badge.Name = "GuestBillboard"
+	badge.Size = UDim2.fromOffset(228, 64)
+	badge.StudsOffset = Vector3.new(0, 2.6, 0)
+	badge.MaxDistance = 80
+	badge.AlwaysOnTop = true
+
+	local title = Instance.new("TextLabel")
+	title.Name = "GuestTitle"
+	title.Size = UDim2.new(1, 0, 0.46, 0)
+	title.BackgroundColor3 = Color3.fromRGB(22, 25, 31)
+	title.BackgroundTransparency = 0.12
+	title.TextColor3 = guestType.color
+	title.Font = Enum.Font.GothamSemibold
+	title.TextScaled = true
+	title.Text = guestType.label
+	title.Parent = badge
+
+	local titleCorner = Instance.new("UICorner")
+	titleCorner.CornerRadius = UDim.new(0, 6)
+	titleCorner.Parent = title
+	local titleStroke = Instance.new("UIStroke")
+	titleStroke.Color = Color3.fromRGB(191, 151, 75)
+	titleStroke.Thickness = 1
+	titleStroke.Parent = title
+
+	local status = Instance.new("TextLabel")
+	status.Name = "GuestStatus"
+	status.Position = UDim2.new(0, 0, 0.5, 0)
+	status.Size = UDim2.new(1, 0, 0.28, 0)
+	status.BackgroundTransparency = 1
+	status.TextColor3 = Color3.fromRGB(226, 226, 226)
+	status.Font = Enum.Font.Gotham
+	status.TextScaled = true
+	status.Text = "WALKING IN"
+	status.Parent = badge
+
+	local barBack = Instance.new("Frame")
+	barBack.Name = "PatienceBack"
+	barBack.Position = UDim2.new(0, 8, 1, -12)
+	barBack.Size = UDim2.new(1, -16, 0, 6)
+	barBack.BackgroundColor3 = Color3.fromRGB(40, 44, 52)
+	barBack.BorderSizePixel = 0
+	barBack.Parent = badge
+
+	local bar = Instance.new("Frame")
+	bar.Name = "Patience"
+	bar.Size = UDim2.fromScale(1, 1)
+	bar.BackgroundColor3 = Color3.fromRGB(120, 210, 140)
+	bar.BorderSizePixel = 0
+	bar.Parent = barBack
+
+	local barCorner = Instance.new("UICorner")
+	barCorner.CornerRadius = UDim.new(0, 3)
+	barCorner.Parent = barBack
+
+	badge.Parent = head
+	return { badge = badge, title = title, status = status, bar = bar }
+end
+
+local guestRng = Random.new()
+
+local function pickGuestType()
+	local roll = guestRng:NextNumber()
+	if roll < 0.18 then
+		return GUEST_TYPES[2]
+	elseif roll < 0.42 then
+		return GUEST_TYPES[3]
+	end
+	return GUEST_TYPES[1]
+end
+
+local function pickRequest(guestType)
+	if guestType.id == "VIP" and guestRng:NextNumber() < 0.6 then
+		return REQUESTS[4]
+	end
+	return REQUESTS[guestRng:NextInteger(1, #REQUESTS)]
+end
+
+local function qualityFor(elapsed, patience)
+	local ratio = elapsed / math.max(patience, 1)
+	if ratio <= 0.4 then
+		return 1, "PERFECT"
+	elseif ratio <= 0.7 then
+		return 0.75, "GOOD"
+	elseif ratio < 1 then
+		return 0.5, "LATE"
+	end
+	return 0, nil
+end
+
+local function rewardFor(state, quality, deskLevel)
+	local value = state.request.base * state.guestType.multiplier * quality
+		* (1 + DESK_INCOME_PER_LEVEL * deskLevel)
+	return math.clamp(math.floor(value + 0.5), 0, RECEPTION_AWARD_CAP)
+end
+
+local function holdDurationFor(guestType, deskLevel)
+	return math.max(0.25, guestType.hold * (1 - DESK_SPEED_PER_LEVEL * deskLevel))
+end
+
+local function nearbyDeskLevel(root)
+	local best = 0
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
+		if playerRoot and (playerRoot.Position - root.Position).Magnitude <= RECEPTION_MAX_DISTANCE then
+			best = math.max(best, deskLevelOf(player))
+		end
+	end
+	return best
+end
+
+local function flashStatus(state, text, color)
 	if state.served or state.leaving then
 		return
 	end
-	state.label.Text = text
-	state.label.TextColor3 = color
-	local token = {}
-	state.token = token
-	task.delay(seconds, function()
-		if state.token == token and not state.served and not state.leaving
-			and state.label.Parent then
-			resetReceptionLabel(state)
-		end
-	end)
+	state.flashUntil = os.clock() + 2
+	state.ui.status.Text = text
+	state.ui.status.TextColor3 = color
 end
 
-local function runReceptionVisit()
-	local geometry = getReceptionGeometry()
-	if not geometry then
+local function updateGuestVisual(state, elapsed)
+	if state.served or state.leaving then
+		return
+	end
+	local patience = state.guestType.patience
+	local remaining = math.max(0, patience - elapsed)
+	local ratio = math.clamp(remaining / patience, 0, 1)
+	state.ui.bar.Size = UDim2.fromScale(ratio, 1)
+	if ratio > 0.7 then
+		state.ui.bar.BackgroundColor3 = Color3.fromRGB(120, 210, 140)
+	elseif ratio > 0.4 then
+		state.ui.bar.BackgroundColor3 = Color3.fromRGB(240, 196, 110)
+	else
+		state.ui.bar.BackgroundColor3 = Color3.fromRGB(226, 110, 100)
+	end
+
+	local index = queueIndexOf(state) or 0
+	local prefix
+	if index == 1 then
+		prefix = "HOLD E TO SERVE"
+	elseif index > 1 then
+		prefix = "WAITING #" .. tostring(index)
+	else
+		prefix = "LEAVING"
+	end
+	if (state.flashUntil or 0) > os.clock() then
+		return
+	end
+	state.ui.status.Text = string.format("%s - %ds", prefix, math.ceil(remaining))
+	if index == 1 then
+		state.ui.status.TextColor3 = Color3.fromRGB(154, 226, 177)
+	else
+		state.ui.status.TextColor3 = Color3.fromRGB(212, 212, 212)
+	end
+end
+
+local function openPromptFor(state)
+	if state.prompt or state.served or state.leaving or not state.guest.Parent then
+		return
+	end
+	if queueIndexOf(state) ~= 1 then
 		return
 	end
 
+	local guestType = state.guestType
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "ReceptionPrompt"
+	prompt.ObjectText = guestType.label .. " - " .. state.request.text
+	prompt.ActionText = "Serve guest"
+	prompt.HoldDuration = holdDurationFor(guestType, nearbyDeskLevel(state.root))
+	prompt.MaxActivationDistance = 12
+	prompt.RequiresLineOfSight = false
+	prompt.Exclusivity = Enum.ProximityPromptExclusivity.OnePerButton
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
+	state.prompt = prompt
+
+	prompt.Triggered:Connect(function(player)
+		if state.served or state.leaving or not state.guest.Parent then
+			return
+		end
+		if queueIndexOf(state) ~= 1 then
+			return
+		end
+		if player.Parent ~= Players then
+			return
+		end
+		if player:GetAttribute("CashLoaded") ~= true then
+			flashStatus(state, "PROFILE LOADING - TRY AGAIN", Color3.fromRGB(240, 190, 120))
+			return
+		end
+		local stats = player:FindFirstChild("leaderstats")
+		local cash = stats and stats:FindFirstChild("Cash")
+		if not cash or not cash:IsA("IntValue") then
+			return
+		end
+		local character = player.Character
+		local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
+		local playerHumanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not playerRoot or not playerHumanoid or playerHumanoid.Health <= 0 then
+			return
+		end
+		if (playerRoot.Position - state.root.Position).Magnitude > RECEPTION_MAX_DISTANCE then
+			return
+		end
+		if (serveCooldown[player] or 0) > os.clock() then
+			flashStatus(state, "DESK BUSY - TRY AGAIN", Color3.fromRGB(240, 190, 120))
+			return
+		end
+
+		local elapsed = os.clock() - (state.arrivedAt or os.clock())
+		local quality, rating = qualityFor(elapsed, guestType.patience)
+		if quality <= 0 then
+			return
+		end
+		local deskLevel = deskLevelOf(player)
+		local reward = rewardFor(state, quality, deskLevel)
+
+		-- Latch first: a duplicated signal, a second player or a replayed
+		-- trigger must never pay the same guest twice.
+		state.served = true
+		state.rating = rating
+		state.reward = reward
+		serveCooldown[player] = os.clock() + RECEPTION_TRIGGER_COOLDOWN
+		state.guest:SetAttribute("Served", true)
+		state.guest:SetAttribute("ServedByUserId", player.UserId)
+		state.guest:SetAttribute("ServedReward", reward)
+		if state.prompt then
+			state.prompt:Destroy()
+			state.prompt = nil
+		end
+		state.ui.title.Text = "+$" .. tostring(reward) .. " | " .. tostring(rating)
+		state.ui.title.TextColor3 = Color3.fromRGB(154, 226, 177)
+		state.ui.status.Text = guestType.label .. " SERVED - DESK LV " .. tostring(deskLevel)
+		state.ui.status.TextColor3 = Color3.fromRGB(154, 226, 177)
+		state.ui.bar.Size = UDim2.fromScale(0, 1)
+
+		cash.Value = math.min(RECEPTION_AWARD_CAP, cash.Value + reward)
+		player:SetAttribute("LastGuestService", state.request.text .. " " .. tostring(rating))
+		-- Same-frame attribute writes can be coalesced before replication, so
+		-- the HUD toast would not fire on a repeat payout. Reset now, raise later.
+		player:SetAttribute("LastGuestReward", 0)
+		task.delay(0.1, function()
+			if player.Parent == Players then
+				player:SetAttribute("LastGuestReward", reward)
+			end
+		end)
+	end)
+
+	prompt.Parent = state.root
+end
+
+local function buildServiceGuest(geometry)
+	local guestType = pickGuestType()
+	local request = pickRequest(guestType)
 	local guest, humanoid, root, head = createGuestAvatar("HotelReceptionGuest")
 	guest:SetAttribute("GuestKind", "Reception")
+	guest:SetAttribute("GuestType", guestType.id)
+	guest:SetAttribute("GuestRequest", request.id)
 	guest:SetAttribute("Served", false)
-	local label = addGuestBadge(head, "HOTEL GUEST", 70)
+
+	local ui = createServiceBadge(head, guestType)
+	ui.title.Text = guestType.label .. " | " .. request.text
+
+	local state = {
+		guest = guest,
+		humanoid = humanoid,
+		root = root,
+		ui = ui,
+		guestType = guestType,
+		request = request,
+		geometry = geometry,
+		slot = 0,
+		served = false,
+		leaving = false,
+		arrivedAt = nil,
+		rating = nil,
+		reward = 0,
+	}
+
 	guest:PivotTo(CFrame.lookAt(geometry.spawnPoint, geometry.spawnPoint + Vector3.new(0, 0, 1)))
 	guest.Parent = guestsFolder
+	receptionQueue[#receptionQueue + 1] = state
+	return state
+end
 
-	local state = { served = false, leaving = false, label = label }
-	local prompt
+local function serveServiceGuest(state)
+	local geometry = state.geometry
+	local guest, humanoid, root = state.guest, state.humanoid, state.root
 
-	local function openPrompt()
-		prompt = Instance.new("ProximityPrompt")
-		prompt.Name = "ReceptionPrompt"
-		prompt.ObjectText = "Hotel Guest"
-		prompt.ActionText = "Check in guest"
-		prompt.HoldDuration = 0.8
-		prompt.MaxActivationDistance = 12
-		prompt.RequiresLineOfSight = false
-		prompt.Exclusivity = Enum.ProximityPromptExclusivity.OneGlobally
-		prompt.KeyboardKeyCode = Enum.KeyCode.E
-		prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
-
-		prompt.Triggered:Connect(function(player)
-			if state.served or state.leaving or not guest.Parent then
-				return
-			end
-			if player.Parent ~= Players then
-				return
-			end
-			if player:GetAttribute("CashLoaded") ~= true then
-				flashReceptionLabel(state, "PROFILE LOADING - TRY AGAIN", Color3.fromRGB(240, 190, 120), 2)
-				return
-			end
-			local stats = player:FindFirstChild("leaderstats")
-			local cash = stats and stats:FindFirstChild("Cash")
-			if not cash or not cash:IsA("IntValue") then
-				return
-			end
-			local character = player.Character
-			local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
-			local playerHumanoid = character and character:FindFirstChildOfClass("Humanoid")
-			if not playerRoot or not playerHumanoid or playerHumanoid.Health <= 0 then
-				return
-			end
-			if (playerRoot.Position - root.Position).Magnitude > RECEPTION_MAX_DISTANCE then
-				return
-			end
-			if (receptionCooldown[player] or 0) > os.clock() then
-				flashReceptionLabel(state, "DESK BUSY - TRY AGAIN", Color3.fromRGB(240, 190, 120), 2)
-				return
-			end
-
-			-- Latch first: a second trigger (or a duplicated signal) must never pay twice.
-			state.served = true
-			guest:SetAttribute("Served", true)
-			prompt:Destroy()
-			cash.Value = math.min(RECEPTION_AWARD_CAP, cash.Value + RECEPTION_REWARD)
-			receptionCooldown[player] = os.clock() + RECEPTION_COOLDOWN
-			-- Same-frame attribute writes can be coalesced before replication, so the
-			-- HUD toast would not fire on a repeat check-in. Reset now, raise later.
-			player:SetAttribute("LastGuestReward", 0)
-			player:SetAttribute("LastGuestService", "HOTEL CHECK-IN")
-			task.delay(0.1, function()
-				if player.Parent == Players then
-					player:SetAttribute("LastGuestReward", RECEPTION_REWARD)
-				end
-			end)
-			state.label.Text = "+$" .. tostring(RECEPTION_REWARD) .. " | CHECK-IN COMPLETE"
-			state.label.TextColor3 = Color3.fromRGB(154, 226, 177)
-		end)
-
-		prompt.Parent = root
+	if not walkRoute(guest, humanoid, { geometry.midPoint }) then
+		error("guest could not reach the lobby")
 	end
 
-	local arrived = walkRoute(guest, humanoid, { geometry.midPoint, geometry.standPoint })
-	if arrived and guest.Parent then
-		local faceAt = geometry.standPoint + Vector3.new(0, 3.1, 0)
-		humanoid.AutoRotate = false
-		guest:PivotTo(CFrame.lookAt(faceAt, faceAt + Vector3.new(0, 0, 1)))
-		openPrompt()
-		local deadline = os.clock() + RECEPTION_PATIENCE
-		while not state.served and guest.Parent and os.clock() < deadline do
-			task.wait(0.25)
-		end
+	while guest.Parent do
 		if state.served then
-			task.wait(1.5)
+			break
 		end
+		local index = queueIndexOf(state)
+		if not index then
+			break
+		end
+		if state.slot ~= index then
+			state.slot = index
+			if not walkRoute(guest, humanoid, { queueSlotPoint(geometry, index) }) then
+				error("queue slot " .. tostring(index) .. " is blocked")
+			end
+			state.arrivedAt = state.arrivedAt or os.clock()
+		end
+		if state.leaving then
+			break
+		end
+		if index == 1 and not state.faced and not state.served then
+			-- Face the desk once; repeated pivots would restart walk animations.
+			state.faced = true
+			humanoid.AutoRotate = false
+			local position = root.Position
+			guest:PivotTo(CFrame.lookAt(position, position + Vector3.new(0, 0, 1)))
+		end
+		openPromptFor(state)
+		if state.prompt then
+			local hold = holdDurationFor(state.guestType, nearbyDeskLevel(root))
+			if math.abs(state.prompt.HoldDuration - hold) > 0.01 then
+				state.prompt.HoldDuration = hold
+			end
+		end
+		local elapsed = state.arrivedAt and (os.clock() - state.arrivedAt) or 0
+		updateGuestVisual(state, elapsed)
+		if state.arrivedAt and elapsed >= state.guestType.patience then
+			break
+		end
+		task.wait(QUEUE_TICK)
+	end
+
+	state.leaving = true
+	local index = queueIndexOf(state)
+	if index then
+		table.remove(receptionQueue, index)
+	end
+	if state.prompt then
+		state.prompt:Destroy()
+		state.prompt = nil
+	end
+	if state.served then
+		task.wait(1.2)
 	end
 
 	if guest.Parent then
-		state.leaving = true
-		if not state.served then
-			state.label.Text = "NO CHECK-IN TODAY"
-			state.label.TextColor3 = Color3.fromRGB(220, 170, 160)
-		end
-		if prompt then
-			prompt:Destroy()
-		end
 		humanoid.AutoRotate = true
-		walkRoute(guest, humanoid, { geometry.exitPoint })
+		if not state.served then
+			state.ui.title.Text = state.guestType.label .. " | NO SERVICE"
+			state.ui.title.TextColor3 = Color3.fromRGB(220, 170, 160)
+			state.ui.status.Text = "LEFT THE QUEUE"
+			state.ui.status.TextColor3 = Color3.fromRGB(220, 170, 160)
+			state.ui.bar.Size = UDim2.fromScale(0, 1)
+		end
+		walkRoute(guest, humanoid, {
+			Vector3.new(root.Position.X, geometry.floorY, geometry.standPoint.Z - 5),
+			geometry.midPoint,
+			geometry.exitPoint,
+		})
 	end
 	guest:Destroy()
 end
 
+local function cleanupServiceGuest(state)
+	if not state then
+		return
+	end
+	state.leaving = true
+	local index = queueIndexOf(state)
+	if index then
+		table.remove(receptionQueue, index)
+	end
+	if state.prompt then
+		state.prompt:Destroy()
+		state.prompt = nil
+	end
+	if state.guest and state.guest.Parent then
+		state.guest:Destroy()
+	end
+end
+
+local function startServiceGuest(geometry)
+	local holder = {}
+	local ok, err = pcall(function()
+		holder.state = buildServiceGuest(geometry)
+		serveServiceGuest(holder.state)
+	end)
+	if not ok then
+		warn("CasinoTycoonGuests: reception guest failed: " .. tostring(err))
+	end
+	cleanupServiceGuest(holder.state)
+end
+
+local STATION_TEXT = "RECEPTION DESK\nUPGRADE +15% INCOME"
+local STATION_COLOR = Color3.fromRGB(235, 197, 111)
+
+local function ensureDeskStation(geometry)
+	if deskStation and deskStation.Parent then
+		return deskStation
+	end
+	local station = Instance.new("Model")
+	station.Name = "ReceptionDeskUpgrade"
+
+	local body = Instance.new("Part")
+	body.Name = "ButtonPart"
+	body.Size = Vector3.new(3, 3, 3)
+	body.Position = Vector3.new(
+		geometry.standPoint.X + 16,
+		geometry.floorY + 1.5,
+		geometry.standPoint.Z + 1
+	)
+	body.Anchored = true
+	body.CanCollide = true
+	body.Material = Enum.Material.Metal
+	body.Color = Color3.fromRGB(124, 96, 56)
+	body.TopSurface = Enum.SurfaceType.Smooth
+	body.Parent = station
+
+	local badge = Instance.new("BillboardGui")
+	badge.Name = "DeskSign"
+	badge.Size = UDim2.fromOffset(210, 52)
+	badge.StudsOffset = Vector3.new(0, 2.6, 0)
+	badge.MaxDistance = 60
+	badge.AlwaysOnTop = true
+	badge.Parent = body
+
+	local label = Instance.new("TextLabel")
+	label.Name = "DeskLabel"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundColor3 = Color3.fromRGB(22, 25, 31)
+	label.BackgroundTransparency = 0.15
+	label.TextColor3 = STATION_COLOR
+	label.Font = Enum.Font.GothamSemibold
+	label.TextScaled = true
+	label.Text = STATION_TEXT
+	label.Parent = badge
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = label
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "DeskUpgradePrompt"
+	prompt.ObjectText = "Reception Desk"
+	prompt.ActionText = "Upgrade desk"
+	prompt.HoldDuration = 0.4
+	prompt.MaxActivationDistance = DESK_MAX_DISTANCE
+	prompt.RequiresLineOfSight = false
+	prompt.Exclusivity = Enum.ProximityPromptExclusivity.OnePerButton
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
+	prompt.Parent = body
+
+	local function flash(text, color, seconds)
+		label.Text = text
+		label.TextColor3 = color or STATION_COLOR
+		local token = {}
+		stationToken = token
+		task.delay(seconds or 2, function()
+			if stationToken == token and label.Parent then
+				label.Text = STATION_TEXT
+				label.TextColor3 = STATION_COLOR
+			end
+		end)
+	end
+
+	prompt.Triggered:Connect(function(player)
+		if player.Parent ~= Players then
+			return
+		end
+		if player:GetAttribute("CashLoaded") ~= true then
+			flash("PROFILE LOADING - TRY AGAIN", Color3.fromRGB(240, 190, 120), 2)
+			return
+		end
+		local character = player.Character
+		local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
+		if not playerRoot or (playerRoot.Position - body.Position).Magnitude > DESK_MAX_DISTANCE + 2 then
+			return
+		end
+		if (upgradeCooldown[player] or 0) > os.clock() then
+			return
+		end
+		local stats = player:FindFirstChild("leaderstats")
+		local cash = stats and stats:FindFirstChild("Cash")
+		if not cash or not cash:IsA("IntValue") then
+			return
+		end
+		local level = deskLevelOf(player)
+		if level >= DESK_MAX_LEVEL then
+			flash("DESK LEVEL MAX", Color3.fromRGB(154, 226, 177), 2)
+			return
+		end
+		local cost = DESK_COSTS[level + 1]
+		if cash.Value < cost then
+			flash("NEED $" .. tostring(cost) .. " FOR DESK " .. tostring(level + 1), Color3.fromRGB(240, 190, 120), 2.5)
+			return
+		end
+		if player:GetAttribute("DataReadOnly") == true then
+			-- A read-only profile would charge cash that can never be saved.
+			flash("PROFILE READ-ONLY - DESK LOCKED", Color3.fromRGB(240, 190, 120), 2.5)
+			return
+		end
+		upgradeCooldown[player] = os.clock() + 1
+
+		-- Charge, then persist. SetDeskLevel clamps to 0..3, refuses downgrades
+		-- and marks the profile dirty so the level survives a rejoin. If the
+		-- write is refused the charge is refunded immediately.
+		cash.Value = math.max(0, cash.Value - cost)
+		local nextLevel = level + 1
+		local stored = true
+		if Data and Data.SetDeskLevel then
+			stored = Data.SetDeskLevel(player, nextLevel)
+		end
+		if stored == false then
+			cash.Value = math.min(RECEPTION_AWARD_CAP, cash.Value + cost)
+			flash("SAVE FAILED - UPGRADE REFUNDED", Color3.fromRGB(240, 190, 120), 2.5)
+			return
+		end
+		player:SetAttribute("DeskLevel", nextLevel)
+		flash("DESK LV " .. tostring(nextLevel) .. " UNLOCKED", Color3.fromRGB(154, 226, 177), 2.5)
+	end)
+
+	station.PrimaryPart = body
+	station.Parent = geometry.lobby or casino
+	deskStation = station
+	return station
+end
+
+-- Drop guests left over from an earlier server (or a previous run in Studio).
+for _, child in ipairs(guestsFolder:GetChildren()) do
+	if child:GetAttribute("GuestKind") == "Reception" then
+		child:Destroy()
+	end
+end
+
+task.spawn(function()
+	local geometry = getReceptionGeometry()
+	if geometry then
+		ensureDeskStation(geometry)
+	end
+end)
+
 task.spawn(function()
 	task.wait(RECEPTION_FIRST_DELAY)
 	while true do
-		if not receptionBusy then
-			receptionBusy = true
-			task.spawn(function()
-				local ok, err = pcall(runReceptionVisit)
-				receptionBusy = false
-				if not ok then
-					warn("CasinoTycoonGuests: reception visit failed: " .. tostring(err))
-					for _, child in ipairs(guestsFolder:GetChildren()) do
-						if child:GetAttribute("GuestKind") == "Reception" then
-							child:Destroy()
-						end
-					end
-				end
-			end)
+		local geometry = getReceptionGeometry()
+		if not geometry then
+			task.wait(RECEPTION_RETRY)
+		else
+			ensureDeskStation(geometry)
+			if #Players:GetPlayers() > 0 and #receptionQueue < QUEUE_SIZE then
+				task.spawn(startServiceGuest, geometry)
+				task.wait(RECEPTION_INTERVAL + Random.new():NextNumber(0, RECEPTION_JITTER))
+			else
+				task.wait(RECEPTION_RETRY)
+			end
 		end
-		task.wait(RECEPTION_INTERVAL + Random.new():NextNumber(0, RECEPTION_JITTER))
 	end
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-	receptionCooldown[player] = nil
+	serveCooldown[player] = nil
+	upgradeCooldown[player] = nil
 end)

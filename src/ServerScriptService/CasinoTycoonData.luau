@@ -13,6 +13,9 @@ local STARTING_CASH = 1000
 local MIN_CASH = 0
 local MAX_CASH = 1000000000
 local MAX_RECEIPTS = 60
+-- Desk upgrade ceiling for the hotel reception desk (kept in sync with
+-- CasinoTycoonGuests DESK_MAX_LEVEL).
+local MAX_DESK_LEVEL = 3
 
 local plotsFolder = workspace:WaitForChild("CasinoTycoon"):WaitForChild("Plots")
 
@@ -171,6 +174,7 @@ local function blankProfile()
 		LastBonusDay = nil,
 		PurchaseIds = {},
 		Milestones = {},
+		DeskLevel = 0,
 	}
 end
 
@@ -185,6 +189,11 @@ local function migrate(raw, player)
 	profile.LastBonusDay = type(raw.LastBonusDay) == "string" and raw.LastBonusDay or nil
 	profile.PurchaseIds = type(raw.PurchaseIds) == "table" and raw.PurchaseIds or {}
 	profile.Milestones = type(raw.Milestones) == "table" and raw.Milestones or {}
+	local deskLevel = math.floor(tonumber(raw.DeskLevel) or 0)
+	if deskLevel ~= deskLevel then
+		deskLevel = 0
+	end
+	profile.DeskLevel = math.clamp(deskLevel, 0, MAX_DESK_LEVEL)
 	if version >= SCHEMA_VERSION and type(raw.Plots) == "table" then
 		for plotId, snapshot in pairs(raw.Plots) do
 			if type(snapshot) == "table" then
@@ -200,7 +209,9 @@ local function migrate(raw, player)
 			end
 		end
 	end
-	return profile, version ~= SCHEMA_VERSION
+	-- Older profiles have no DeskLevel: backfill it once so the field is written.
+	local needsBackfill = type(raw.DeskLevel) ~= "number"
+	return profile, version ~= SCHEMA_VERSION or needsBackfill
 end
 
 local sessions = {}
@@ -405,6 +416,34 @@ function Data.MarkDirty(player)
 	if session then
 		session.dirty = true
 	end
+end
+
+-- Desk upgrade level (0..MAX_DESK_LEVEL). Persisted inside the profile so a paid
+-- upgrade survives a rejoin; the guest script marks the session dirty on change.
+function Data.GetDeskLevel(player)
+	local session = sessions[player]
+	local profile = session and session.data
+	if not profile then
+		return nil
+	end
+	return math.clamp(tonumber(profile.DeskLevel) or 0, 0, MAX_DESK_LEVEL)
+end
+
+function Data.SetDeskLevel(player, level)
+	local session = sessions[player]
+	if not session or not session.ready or session.readOnly then
+		return false
+	end
+	local profile = session.data
+	local current = math.clamp(tonumber(profile.DeskLevel) or 0, 0, MAX_DESK_LEVEL)
+	local target = math.clamp(math.floor(tonumber(level) or 0), 0, MAX_DESK_LEVEL)
+	if target <= current then
+		-- Upgrades are never downgraded or re-applied by a stale request.
+		return false
+	end
+	profile.DeskLevel = target
+	Data.MarkDirty(player)
+	return true
 end
 
 function Data.GetPlotSnapshot(player, plotId)
