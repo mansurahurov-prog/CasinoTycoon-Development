@@ -324,6 +324,10 @@ local function writeProfile(player, releaseAfter)
 	if not session or not session.ready then
 		return false
 	end
+	-- A release started for this session: any late save must not re-arm the lock.
+	if releaseAfter then
+		session.released = true
+	end
 	if session.readOnly or not session.lockHeld then
 		return false
 	end
@@ -349,7 +353,7 @@ local function writeProfile(player, releaseAfter)
 					return nil
 				end
 			end
-			if releaseAfter then
+			if releaseAfter or session.released then
 				payload.Lock = nil
 			else
 				payload.Lock = { At = os.time(), Server = game.JobId, UserId = player.UserId }
@@ -390,6 +394,10 @@ end
 function Data.IsReady(player)
 	local session = sessions[player]
 	return session ~= nil and session.ready
+end
+
+function Data.IsPersistent()
+	return store ~= nil
 end
 
 function Data.MarkDirty(player)
