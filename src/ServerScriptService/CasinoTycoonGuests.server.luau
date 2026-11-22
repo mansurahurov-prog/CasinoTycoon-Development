@@ -329,7 +329,7 @@ local function runReceptionVisit()
 		prompt.HoldDuration = 0.8
 		prompt.MaxActivationDistance = 12
 		prompt.RequiresLineOfSight = false
-		prompt.Exclusivity = Enum.ProximityPromptExclusivity.OneGlobal
+		prompt.Exclusivity = Enum.ProximityPromptExclusivity.OneGlobally
 		prompt.KeyboardKeyCode = Enum.KeyCode.E
 		prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
 
