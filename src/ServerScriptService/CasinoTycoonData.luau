@@ -392,6 +392,10 @@ function Data.IsReady(player)
 	return session ~= nil and session.ready
 end
 
+function Data.IsPersistent()
+	return store ~= nil
+end
+
 function Data.MarkDirty(player)
 	local session = sessions[player]
 	if session then
