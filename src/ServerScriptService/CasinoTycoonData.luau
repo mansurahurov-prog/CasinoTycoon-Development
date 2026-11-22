@@ -13,6 +13,9 @@ local STARTING_CASH = 1000
 local MIN_CASH = 0
 local MAX_CASH = 1000000000
 local MAX_RECEIPTS = 60
+-- Desk upgrade ceiling for the hotel reception desk (kept in sync with
+-- CasinoTycoonGuests DESK_MAX_LEVEL).
+local MAX_DESK_LEVEL = 3
 
 local plotsFolder = workspace:WaitForChild("CasinoTycoon"):WaitForChild("Plots")
 
@@ -66,6 +69,52 @@ function memoryBackend:UpdateAsync(key, transform)
 end
 
 local backend = store or memoryBackend
+
+local function deepCopy(value)
+	if type(value) ~= "table" then
+		return value
+	end
+	local copy = {}
+	for key, entry in pairs(value) do
+		copy[key] = deepCopy(entry)
+	end
+	return copy
+end
+
+-- One writer per profile. Two overlapping UpdateAsync calls would share the
+-- live session table and could serialise a half-updated payload, so every
+-- write for a player is queued behind the previous one.
+local function newMutex()
+	return { locked = false, waiters = {} }
+end
+
+local function acquireMutex(mutex)
+	if not mutex.locked then
+		mutex.locked = true
+		return
+	end
+	table.insert(mutex.waiters, coroutine.running())
+	coroutine.yield()
+end
+
+local function releaseMutex(mutex)
+	local nextThread = table.remove(mutex.waiters, 1)
+	if nextThread then
+		task.defer(nextThread)
+	else
+		mutex.locked = false
+	end
+end
+
+local function withMutex(mutex, callback)
+	acquireMutex(mutex)
+	local ok, result, extra = pcall(callback)
+	releaseMutex(mutex)
+	if not ok then
+		return false, result
+	end
+	return result, extra
+end
 
 local function withRetry(label, callback)
 	if not backend then
@@ -171,6 +220,7 @@ local function blankProfile()
 		LastBonusDay = nil,
 		PurchaseIds = {},
 		Milestones = {},
+		DeskLevel = 0,
 	}
 end
 
@@ -185,6 +235,11 @@ local function migrate(raw, player)
 	profile.LastBonusDay = type(raw.LastBonusDay) == "string" and raw.LastBonusDay or nil
 	profile.PurchaseIds = type(raw.PurchaseIds) == "table" and raw.PurchaseIds or {}
 	profile.Milestones = type(raw.Milestones) == "table" and raw.Milestones or {}
+	local deskLevel = math.floor(tonumber(raw.DeskLevel) or 0)
+	if deskLevel ~= deskLevel then
+		deskLevel = 0
+	end
+	profile.DeskLevel = math.clamp(deskLevel, 0, MAX_DESK_LEVEL)
 	if version >= SCHEMA_VERSION and type(raw.Plots) == "table" then
 		for plotId, snapshot in pairs(raw.Plots) do
 			if type(snapshot) == "table" then
@@ -200,10 +255,22 @@ local function migrate(raw, player)
 			end
 		end
 	end
-	return profile, version ~= SCHEMA_VERSION
+	-- Older profiles have no DeskLevel: backfill it once so the field is written.
+	local needsBackfill = type(raw.DeskLevel) ~= "number"
+	return profile, version ~= SCHEMA_VERSION or needsBackfill
 end
 
 local sessions = {}
+
+-- Dirty tracking carries a monotonic revision so a save that started before a
+-- newer change cannot clear the flag for that change.
+local function markDirty(session)
+	if not session then
+		return
+	end
+	session.dirty = true
+	session.revision = (session.revision or 0) + 1
+end
 
 local function acquireLock(player, key)
 	local now = os.time()
@@ -241,7 +308,18 @@ local function loadPlayer(player)
 	if sessions[player] then
 		return
 	end
-	local session = { ready = false, dirty = false, readOnly = false, lockHeld = false, data = blankProfile() }
+	local session = {
+		ready = false,
+		dirty = false,
+		readOnly = false,
+		lockHeld = false,
+		released = false,
+		purchasing = false,
+		revision = 0,
+		savedRevision = 0,
+		writeMutex = newMutex(),
+		data = blankProfile(),
+	}
 	sessions[player] = session
 	local key = keyFor(player)
 	local raw
@@ -282,14 +360,14 @@ local function loadPlayer(player)
 	local profile, migrated = migrate(raw, player)
 	session.data = profile
 	if migrated then
-		session.dirty = true
+		markDirty(session)
 	end
 
 	local cash = publishCash(player, profile.Cash)
 	if cash then
 		cash:GetPropertyChangedSignal("Value"):Connect(function()
 			if sessions[player] == session then
-				session.dirty = true
+				markDirty(session)
 			end
 		end)
 	end
@@ -319,22 +397,14 @@ local function releaseLock(player)
 	end)
 end
 
-local function writeProfile(player, releaseAfter)
-	local session = sessions[player]
-	if not session or not session.ready then
+local function performWrite(player, session, releaseAfter)
+	if sessions[player] ~= session then
 		return false
-	end
-	-- A release started for this session: any late save must not re-arm the lock.
-	if releaseAfter then
-		session.released = true
 	end
 	if session.readOnly or not session.lockHeld then
 		return false
 	end
-	if not backend then
-		return false
-	end
-	if not session.dirty and not releaseAfter then
+	if not session.dirty and not releaseAfter and session.revision == session.savedRevision then
 		return true
 	end
 	local cash = cashValue(player)
@@ -344,7 +414,11 @@ local function writeProfile(player, releaseAfter)
 	session.data.Version = SCHEMA_VERSION
 	session.data.SavedAt = os.time()
 
-	local payload = session.data
+	-- Snapshot under the write lock. The payload must not alias session.data,
+	-- otherwise a save still in flight is rewritten by later edits and two
+	-- concurrent writes serialise the same shared table.
+	local revision = session.revision
+	local payload = deepCopy(session.data)
 	local saved = withRetry("save " .. player.Name, function()
 		return backend:UpdateAsync(keyFor(player), function(current)
 			if type(current) == "table" and type(current.Lock) == "table" then
@@ -362,13 +436,39 @@ local function writeProfile(player, releaseAfter)
 		end)
 	end)
 	if saved then
-		session.dirty = false
+		session.savedRevision = revision
+		if session.revision == revision then
+			session.dirty = false
+		end
 		if releaseAfter then
 			session.lockHeld = false
 		end
 		return true
 	end
 	return false
+end
+
+-- Every write for a profile goes through the session mutex, so autosave,
+-- PlayerRemoving, BindToClose and a desk purchase can never overlap.
+local function writeProfile(player, releaseAfter)
+	local session = sessions[player]
+	if not session or not session.ready then
+		return false
+	end
+	-- A release started for this session: any late save must not re-arm the lock.
+	if releaseAfter then
+		session.released = true
+	end
+	if session.readOnly or not session.lockHeld then
+		return false
+	end
+	if not backend then
+		return false
+	end
+	local ok = withMutex(session.writeMutex, function()
+		return performWrite(player, session, releaseAfter)
+	end)
+	return ok == true
 end
 
 local Data = {}
@@ -401,10 +501,104 @@ function Data.IsPersistent()
 end
 
 function Data.MarkDirty(player)
+	markDirty(sessions[player])
+end
+
+-- Desk upgrade level (0..MAX_DESK_LEVEL). Persisted inside the profile so a paid
+-- upgrade survives a rejoin; the guest script marks the session dirty on change.
+function Data.GetDeskLevel(player)
 	local session = sessions[player]
-	if session then
-		session.dirty = true
+	local profile = session and session.data
+	if not profile then
+		return nil
 	end
+	return math.clamp(tonumber(profile.DeskLevel) or 0, 0, MAX_DESK_LEVEL)
+end
+
+-- A failed write does not prove the payload was rejected: a timeout or a lost
+-- reply may still have committed it. Re-read the key before refunding, and
+-- refund as a delta so wins/losses that happened during the write survive.
+local function reconcileDeskWrite(player, session, previousLevel, price)
+	local stored = withRetry("verify " .. player.Name, function()
+		return backend:GetAsync(keyFor(player))
+	end)
+	if type(stored) == "table" then
+		local storedLevel = math.floor(tonumber(stored.DeskLevel) or 0)
+		if storedLevel >= previousLevel + 1 then
+			-- The write landed: keep the charge and the upgrade.
+			session.data.DeskLevel = math.max(tonumber(session.data.DeskLevel) or 0, storedLevel)
+			return "granted"
+		end
+		-- Definitively not stored: give the money back, as a delta.
+		local cash = cashValue(player)
+		if cash then
+			cash.Value = clampCash(cash.Value + price)
+		end
+		if session.data.DeskLevel == previousLevel + 1 then
+			session.data.DeskLevel = previousLevel
+		end
+		markDirty(session)
+		return "refunded"
+	end
+	-- Undecidable: keeping the charge and the level locally means the next
+	-- successful save persists exactly that state, so the player can never end
+	-- up holding both the upgrade and the refunded money.
+	markDirty(session)
+	return "unknown"
+end
+
+-- Durable desk purchase. Cash and DeskLevel go out in one payload, and the
+-- level is granted only after that write is confirmed. A failed write may
+-- still have landed, so the stored profile is re-read before money is
+-- refunded. Returns ok, newLevelOrReason, persisted.
+function Data.PurchaseDeskUpgrade(player, cost, maxLevel)
+	local session = sessions[player]
+	if not session or not session.ready then
+		return false, "NotReady"
+	end
+	if session.readOnly or not session.lockHeld then
+		return false, "ReadOnly"
+	end
+	if session.purchasing then
+		return false, "Busy"
+	end
+
+	local profile = session.data
+	local ceiling = math.clamp(math.floor(tonumber(maxLevel) or MAX_DESK_LEVEL), 1, MAX_DESK_LEVEL)
+	local level = math.clamp(tonumber(profile.DeskLevel) or 0, 0, ceiling)
+	if level >= ceiling then
+		return false, "MaxLevel"
+	end
+	local price = math.floor(tonumber(cost) or -1)
+	if price < 0 then
+		return false, "BadCost"
+	end
+	local cash = cashValue(player)
+	if not cash then
+		return false, "NoCash"
+	end
+	if cash.Value < price then
+		return false, "NotEnoughCash"
+	end
+
+	session.purchasing = true
+	cash.Value = clampCash(cash.Value - price)
+	profile.DeskLevel = level + 1
+	markDirty(session)
+
+	local persisted = true
+	if not writeProfile(player, false) then
+		local outcome = reconcileDeskWrite(player, session, level, price)
+		if outcome == "refunded" then
+			session.purchasing = nil
+			return false, "SaveFailed"
+		end
+		-- "granted" was confirmed by the re-read; only an unreadable store is
+		-- still pending, and the next save persists the same state.
+		persisted = outcome == "granted"
+	end
+	session.purchasing = nil
+	return true, level + 1, persisted
 end
 
 function Data.GetPlotSnapshot(player, plotId)
@@ -423,7 +617,7 @@ function Data.SetPlotSnapshot(player, plotId, snapshot)
 		return
 	end
 	profile.Plots[tostring(plotId)] = snapshot
-	session.dirty = true
+	markDirty(session)
 end
 
 function Data.ApplyPlot(player, plot, snapshot)
@@ -479,9 +673,10 @@ function Data.Save(player)
 end
 
 function Data.SaveAndRelease(player)
-	local ok = writeProfile(player, true)
 	local session = sessions[player]
+	local ok = writeProfile(player, true)
 	if session and not session.lockHeld then
+		session.closed = true
 		sessions[player] = nil
 	end
 	return ok
