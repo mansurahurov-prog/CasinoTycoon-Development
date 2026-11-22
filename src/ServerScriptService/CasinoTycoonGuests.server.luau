@@ -53,7 +53,7 @@ local function getActiveService(plot, ownerId)
 	return nil
 end
 
-local function makeGuest(ownerId, plot, service)
+local function createGuestAvatar(modelName)
 	local description = Instance.new("HumanoidDescription")
 	local skin = Color3.fromRGB(199, 153, 122)
 	local jacketColors = {
@@ -79,10 +79,7 @@ local function makeGuest(ownerId, plot, service)
 	end
 
 	local guest = guestOrError
-	guest.Name = "HotelGuest"
-	guest:SetAttribute("VisitorForUserId", ownerId)
-	guest:SetAttribute("VisitorForPlot", plot.Name)
-	guest:SetAttribute("ServiceType", service.title)
+	guest.Name = modelName
 	local humanoid = guest:FindFirstChildOfClass("Humanoid")
 	local root = guest:FindFirstChild("HumanoidRootPart")
 	local head = guest:FindFirstChild("Head")
@@ -96,11 +93,15 @@ local function makeGuest(ownerId, plot, service)
 	humanoid.JumpPower = 0
 	humanoid.AutoRotate = true
 
+	return guest, humanoid, root, head
+end
+
+local function addGuestBadge(head, text, maxDistance)
 	local badge = Instance.new("BillboardGui")
 	badge.Name = "GuestBillboard"
 	badge.Size = UDim2.fromOffset(176, 34)
 	badge.StudsOffset = Vector3.new(0, 2.25, 0)
-	badge.MaxDistance = 60
+	badge.MaxDistance = maxDistance
 	badge.AlwaysOnTop = true
 	badge.Parent = head
 
@@ -112,7 +113,7 @@ local function makeGuest(ownerId, plot, service)
 	label.TextColor3 = Color3.fromRGB(235, 197, 111)
 	label.Font = Enum.Font.GothamSemibold
 	label.TextScaled = true
-	label.Text = service.title .. " GUEST"
+	label.Text = text
 	label.Parent = badge
 
 	local corner = Instance.new("UICorner")
@@ -122,6 +123,16 @@ local function makeGuest(ownerId, plot, service)
 	outline.Color = Color3.fromRGB(191, 151, 75)
 	outline.Thickness = 1
 	outline.Parent = label
+
+	return label
+end
+
+local function makeGuest(ownerId, plot, service)
+	local guest, humanoid, root, head = createGuestAvatar("HotelGuest")
+	guest:SetAttribute("VisitorForUserId", ownerId)
+	guest:SetAttribute("VisitorForPlot", plot.Name)
+	guest:SetAttribute("ServiceType", service.title)
+	addGuestBadge(head, service.title .. " GUEST", 60)
 
 	guest.Parent = guestsFolder
 	return guest, humanoid, root
@@ -216,4 +227,216 @@ task.spawn(function()
 			end
 		end
 	end
+end)
+
+-- Front desk: interactive one-shot check-in cycle.
+-- One reception guest walks into the lobby and waits at the counter. Any player
+-- with loaded cash can serve the guest once through a ProximityPrompt. The guest
+-- is never re-servable: the prompt is destroyed and the served flag is latched
+-- before the reward is applied.
+local RECEPTION_FIRST_DELAY = 14
+local RECEPTION_INTERVAL = 35
+local RECEPTION_JITTER = 10
+local RECEPTION_REWARD = 60
+local RECEPTION_COOLDOWN = 30
+local RECEPTION_PATIENCE = 90
+local RECEPTION_MAX_DISTANCE = 18
+local RECEPTION_AWARD_CAP = 1000000000
+
+local receptionCooldown = {}
+local receptionBusy = false
+local receptionGeometry
+local receptionWarned = false
+
+local function warnReceptionOnce(message)
+	if receptionWarned then
+		return
+	end
+	receptionWarned = true
+	warn("CasinoTycoonGuests: " .. message)
+end
+
+local function getReceptionGeometry()
+	if receptionGeometry then
+		return receptionGeometry
+	end
+	local district = casino:FindFirstChild("CentralDistrict")
+	local hotel = district and district:FindFirstChild("GrandCasinoHotel")
+	local lobby = hotel and hotel:FindFirstChild("GrandLobby")
+	local floor = lobby and lobby:FindFirstChild("LobbyMarbleFloor", true)
+	local desk = lobby and lobby:FindFirstChild("DeskBody", true)
+	if not (floor and desk and floor:IsA("BasePart") and desk:IsA("BasePart")) then
+		warnReceptionOnce("reception floor or desk missing, front desk cycle disabled")
+		return nil
+	end
+
+	local floorY = floor.Position.Y + floor.Size.Y / 2
+	local x = desk.Position.X
+	local standZ = desk.Position.Z - desk.Size.Z / 2 - 2.2
+	local spawnZ = floor.Position.Z - floor.Size.Z / 2 + 3
+	receptionGeometry = {
+		floorY = floorY,
+		standPoint = Vector3.new(x, floorY, standZ),
+		midPoint = Vector3.new(x, floorY, spawnZ + (standZ - spawnZ) * 0.45),
+		spawnPoint = Vector3.new(x, floorY + 3.1, spawnZ),
+		exitPoint = Vector3.new(x, floorY, spawnZ - 1.5),
+	}
+	return receptionGeometry
+end
+
+local function resetReceptionLabel(state)
+	state.label.Text = "HOTEL GUEST"
+	state.label.TextColor3 = Color3.fromRGB(235, 197, 111)
+end
+
+local function flashReceptionLabel(state, text, color, seconds)
+	if state.served or state.leaving then
+		return
+	end
+	state.label.Text = text
+	state.label.TextColor3 = color
+	local token = {}
+	state.token = token
+	task.delay(seconds, function()
+		if state.token == token and not state.served and not state.leaving
+			and state.label.Parent then
+			resetReceptionLabel(state)
+		end
+	end)
+end
+
+local function runReceptionVisit()
+	local geometry = getReceptionGeometry()
+	if not geometry then
+		return
+	end
+
+	local guest, humanoid, root, head = createGuestAvatar("HotelReceptionGuest")
+	guest:SetAttribute("GuestKind", "Reception")
+	guest:SetAttribute("Served", false)
+	local label = addGuestBadge(head, "HOTEL GUEST", 70)
+	guest:PivotTo(CFrame.lookAt(geometry.spawnPoint, geometry.spawnPoint + Vector3.new(0, 0, 1)))
+	guest.Parent = guestsFolder
+
+	local state = { served = false, leaving = false, label = label }
+	local prompt
+
+	local function openPrompt()
+		prompt = Instance.new("ProximityPrompt")
+		prompt.Name = "ReceptionPrompt"
+		prompt.ObjectText = "Hotel Guest"
+		prompt.ActionText = "Check in guest"
+		prompt.HoldDuration = 0.8
+		prompt.MaxActivationDistance = 12
+		prompt.RequiresLineOfSight = false
+		prompt.Exclusivity = Enum.ProximityPromptExclusivity.OneGlobally
+		prompt.KeyboardKeyCode = Enum.KeyCode.E
+		prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
+
+		prompt.Triggered:Connect(function(player)
+			if state.served or state.leaving or not guest.Parent then
+				return
+			end
+			if player.Parent ~= Players then
+				return
+			end
+			if player:GetAttribute("CashLoaded") ~= true then
+				flashReceptionLabel(state, "PROFILE LOADING - TRY AGAIN", Color3.fromRGB(240, 190, 120), 2)
+				return
+			end
+			local stats = player:FindFirstChild("leaderstats")
+			local cash = stats and stats:FindFirstChild("Cash")
+			if not cash or not cash:IsA("IntValue") then
+				return
+			end
+			local character = player.Character
+			local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
+			local playerHumanoid = character and character:FindFirstChildOfClass("Humanoid")
+			if not playerRoot or not playerHumanoid or playerHumanoid.Health <= 0 then
+				return
+			end
+			if (playerRoot.Position - root.Position).Magnitude > RECEPTION_MAX_DISTANCE then
+				return
+			end
+			if (receptionCooldown[player] or 0) > os.clock() then
+				flashReceptionLabel(state, "DESK BUSY - TRY AGAIN", Color3.fromRGB(240, 190, 120), 2)
+				return
+			end
+
+			-- Latch first: a second trigger (or a duplicated signal) must never pay twice.
+			state.served = true
+			guest:SetAttribute("Served", true)
+			prompt:Destroy()
+			cash.Value = math.min(RECEPTION_AWARD_CAP, cash.Value + RECEPTION_REWARD)
+			receptionCooldown[player] = os.clock() + RECEPTION_COOLDOWN
+			-- Same-frame attribute writes can be coalesced before replication, so the
+			-- HUD toast would not fire on a repeat check-in. Reset now, raise later.
+			player:SetAttribute("LastGuestReward", 0)
+			player:SetAttribute("LastGuestService", "HOTEL CHECK-IN")
+			task.delay(0.1, function()
+				if player.Parent == Players then
+					player:SetAttribute("LastGuestReward", RECEPTION_REWARD)
+				end
+			end)
+			state.label.Text = "+$" .. tostring(RECEPTION_REWARD) .. " | CHECK-IN COMPLETE"
+			state.label.TextColor3 = Color3.fromRGB(154, 226, 177)
+		end)
+
+		prompt.Parent = root
+	end
+
+	local arrived = walkRoute(guest, humanoid, { geometry.midPoint, geometry.standPoint })
+	if arrived and guest.Parent then
+		local faceAt = geometry.standPoint + Vector3.new(0, 3.1, 0)
+		humanoid.AutoRotate = false
+		guest:PivotTo(CFrame.lookAt(faceAt, faceAt + Vector3.new(0, 0, 1)))
+		openPrompt()
+		local deadline = os.clock() + RECEPTION_PATIENCE
+		while not state.served and guest.Parent and os.clock() < deadline do
+			task.wait(0.25)
+		end
+		if state.served then
+			task.wait(1.5)
+		end
+	end
+
+	if guest.Parent then
+		state.leaving = true
+		if not state.served then
+			state.label.Text = "NO CHECK-IN TODAY"
+			state.label.TextColor3 = Color3.fromRGB(220, 170, 160)
+		end
+		if prompt then
+			prompt:Destroy()
+		end
+		humanoid.AutoRotate = true
+		walkRoute(guest, humanoid, { geometry.exitPoint })
+	end
+	guest:Destroy()
+end
+
+task.spawn(function()
+	task.wait(RECEPTION_FIRST_DELAY)
+	while true do
+		if not receptionBusy then
+			receptionBusy = true
+			task.spawn(function()
+				local ok, err = pcall(runReceptionVisit)
+				receptionBusy = false
+				if not ok then
+					warn("CasinoTycoonGuests: reception visit failed: " .. tostring(err))
+					for _, child in ipairs(guestsFolder:GetChildren()) do
+						if child:GetAttribute("GuestKind") == "Reception" then
+							child:Destroy()
+						end
+					end
+				end
+			end)
+		end
+		task.wait(RECEPTION_INTERVAL + Random.new():NextNumber(0, RECEPTION_JITTER))
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	receptionCooldown[player] = nil
 end)
