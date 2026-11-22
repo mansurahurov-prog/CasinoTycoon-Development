@@ -429,21 +429,49 @@ function Data.GetDeskLevel(player)
 	return math.clamp(tonumber(profile.DeskLevel) or 0, 0, MAX_DESK_LEVEL)
 end
 
-function Data.SetDeskLevel(player, level)
+-- Durable desk purchase. Cash and DeskLevel are written in the same payload, and
+-- the level is only granted after that write succeeded. A failed write reverts
+-- both the profile field and leaderstats cash, so money is never lost without
+-- the upgrade being stored. Returns ok, newLevelOrReason.
+function Data.PurchaseDeskUpgrade(player, cost, maxLevel)
 	local session = sessions[player]
-	if not session or not session.ready or session.readOnly then
-		return false
+	if not session or not session.ready then
+		return false, "NotReady"
 	end
+	if session.readOnly or not session.lockHeld then
+		return false, "ReadOnly"
+	end
+
 	local profile = session.data
-	local current = math.clamp(tonumber(profile.DeskLevel) or 0, 0, MAX_DESK_LEVEL)
-	local target = math.clamp(math.floor(tonumber(level) or 0), 0, MAX_DESK_LEVEL)
-	if target <= current then
-		-- Upgrades are never downgraded or re-applied by a stale request.
-		return false
+	local ceiling = math.clamp(math.floor(tonumber(maxLevel) or MAX_DESK_LEVEL), 1, MAX_DESK_LEVEL)
+	local level = math.clamp(tonumber(profile.DeskLevel) or 0, 0, ceiling)
+	if level >= ceiling then
+		return false, "MaxLevel"
 	end
-	profile.DeskLevel = target
-	Data.MarkDirty(player)
-	return true
+	local price = math.floor(tonumber(cost) or -1)
+	if price < 0 then
+		return false, "BadCost"
+	end
+	local cash = cashValue(player)
+	if not cash then
+		return false, "NoCash"
+	end
+	if cash.Value < price then
+		return false, "NotEnoughCash"
+	end
+
+	local previousCash = cash.Value
+	cash.Value = clampCash(previousCash - price)
+	profile.DeskLevel = level + 1
+	session.dirty = true
+	if not writeProfile(player, false) then
+		-- Undo the in-memory charge: nothing was stored, so nothing is owed.
+		cash.Value = clampCash(previousCash)
+		profile.DeskLevel = level
+		session.dirty = true
+		return false, "SaveFailed"
+	end
+	return true, level + 1
 end
 
 function Data.GetPlotSnapshot(player, plotId)

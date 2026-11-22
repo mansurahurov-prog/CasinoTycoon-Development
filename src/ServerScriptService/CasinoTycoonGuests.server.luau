@@ -356,18 +356,49 @@ local function getReceptionGeometry()
 end
 
 local receptionQueue = {}
+local receptionPending = 0
 local serveCooldown = {}
 local upgradeCooldown = {}
+local purchasing = {}
 local deskStation
 local stationToken
 
-local function queueIndexOf(state)
-	for index, candidate in ipairs(receptionQueue) do
+local function queueIndexIn(queue, state)
+	for index, candidate in ipairs(queue) do
 		if candidate == state then
 			return index
 		end
 	end
 	return nil
+end
+
+local function queueIndexOf(state)
+	return queueIndexIn(receptionQueue, state)
+end
+
+-- Capacity counts guests that already hold a slot and guests still being built
+-- (avatar creation yields), so the spawner can never overshoot QUEUE_SIZE.
+local function hasQueueCapacity(queueLength, pending, size)
+	return queueLength + pending < size
+end
+
+-- Remove one guest without touching the others; survivors keep their relative
+-- order and simply re-derive their index on the next tick.
+local function queueRemove(queue, state)
+	local index = queueIndexIn(queue, state)
+	if index then
+		table.remove(queue, index)
+	end
+	return index
+end
+
+-- Patience is measured from the first slot the guest takes. Walking forward in
+-- the queue must never restart the clock.
+local function ensureArrivalTime(state, now)
+	if state.arrivedAt == nil then
+		state.arrivedAt = now
+	end
+	return state.arrivedAt
 end
 
 local function queueSlotPoint(geometry, index)
@@ -473,20 +504,21 @@ local function rewardFor(state, quality, deskLevel)
 	return math.clamp(math.floor(value + 0.5), 0, RECEPTION_AWARD_CAP)
 end
 
-local function holdDurationFor(guestType, deskLevel)
-	return math.max(0.25, guestType.hold * (1 - DESK_SPEED_PER_LEVEL * deskLevel))
+-- Hold time is a property of the guest, not of whoever stands nearby, so it is
+-- identical for every player at the counter. The desk speed bonus is applied to
+-- the serving player's own timing instead (see effectiveWait).
+local function holdDurationFor(guestType)
+	return math.max(0.25, guestType.hold)
 end
 
-local function nearbyDeskLevel(root)
-	local best = 0
-	for _, player in ipairs(Players:GetPlayers()) do
-		local character = player.Character
-		local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
-		if playerRoot and (playerRoot.Position - root.Position).Magnitude <= RECEPTION_MAX_DISTANCE then
-			best = math.max(best, deskLevelOf(player))
-		end
+-- Desk speed (DeskLevel) shortens the service time of the player who owns that
+-- level: the guest is processed faster, so less of its patience is consumed.
+-- Called only with the level of the player who is serving and being paid.
+local function effectiveWait(elapsed, deskLevel)
+	if elapsed <= 0 then
+		return 0
 	end
-	return best
+	return elapsed / (1 + DESK_SPEED_PER_LEVEL * deskLevel)
 end
 
 local function flashStatus(state, text, color)
@@ -547,7 +579,7 @@ local function openPromptFor(state)
 	prompt.Name = "ReceptionPrompt"
 	prompt.ObjectText = guestType.label .. " - " .. state.request.text
 	prompt.ActionText = "Serve guest"
-	prompt.HoldDuration = holdDurationFor(guestType, nearbyDeskLevel(state.root))
+	prompt.HoldDuration = holdDurationFor(guestType)
 	prompt.MaxActivationDistance = 12
 	prompt.RequiresLineOfSight = false
 	prompt.Exclusivity = Enum.ProximityPromptExclusivity.OnePerButton
@@ -588,12 +620,13 @@ local function openPromptFor(state)
 			return
 		end
 
+		local deskLevel = deskLevelOf(player)
 		local elapsed = os.clock() - (state.arrivedAt or os.clock())
-		local quality, rating = qualityFor(elapsed, guestType.patience)
+		-- Both the speed bonus and the income bonus come from this same player.
+		local quality, rating = qualityFor(effectiveWait(elapsed, deskLevel), guestType.patience)
 		if quality <= 0 then
 			return
 		end
-		local deskLevel = deskLevelOf(player)
 		local reward = rewardFor(state, quality, deskLevel)
 
 		-- Latch first: a duplicated signal, a second player or a replayed
@@ -685,9 +718,15 @@ local function serveServiceGuest(state)
 			if not walkRoute(guest, humanoid, { queueSlotPoint(geometry, index) }) then
 				error("queue slot " .. tostring(index) .. " is blocked")
 			end
-			state.arrivedAt = state.arrivedAt or os.clock()
+			ensureArrivalTime(state, os.clock())
 		end
 		if state.leaving then
+			break
+		end
+		local elapsed = state.arrivedAt and (os.clock() - state.arrivedAt) or 0
+		if state.arrivedAt and elapsed >= state.guestType.patience then
+			-- Checked before the prompt opens: a guest that ran out of patience
+			-- while walking forward must never be offered to a player.
 			break
 		end
 		if index == 1 and not state.faced and not state.served then
@@ -698,25 +737,12 @@ local function serveServiceGuest(state)
 			guest:PivotTo(CFrame.lookAt(position, position + Vector3.new(0, 0, 1)))
 		end
 		openPromptFor(state)
-		if state.prompt then
-			local hold = holdDurationFor(state.guestType, nearbyDeskLevel(root))
-			if math.abs(state.prompt.HoldDuration - hold) > 0.01 then
-				state.prompt.HoldDuration = hold
-			end
-		end
-		local elapsed = state.arrivedAt and (os.clock() - state.arrivedAt) or 0
 		updateGuestVisual(state, elapsed)
-		if state.arrivedAt and elapsed >= state.guestType.patience then
-			break
-		end
 		task.wait(QUEUE_TICK)
 	end
 
 	state.leaving = true
-	local index = queueIndexOf(state)
-	if index then
-		table.remove(receptionQueue, index)
-	end
+	queueRemove(receptionQueue, state)
 	if state.prompt then
 		state.prompt:Destroy()
 		state.prompt = nil
@@ -748,10 +774,7 @@ local function cleanupServiceGuest(state)
 		return
 	end
 	state.leaving = true
-	local index = queueIndexOf(state)
-	if index then
-		table.remove(receptionQueue, index)
-	end
+	queueRemove(receptionQueue, state)
 	if state.prompt then
 		state.prompt:Destroy()
 		state.prompt = nil
@@ -761,16 +784,22 @@ local function cleanupServiceGuest(state)
 	end
 end
 
+-- Capacity is reserved *before* the avatar is created: createGuestAvatar yields
+-- (Players:CreateHumanoidModelFromDescriptionAsync), so without the reservation
+-- a slow avatar service would let the spawner start more than three guests.
 local function startServiceGuest(geometry)
-	local holder = {}
-	local ok, err = pcall(function()
-		holder.state = buildServiceGuest(geometry)
-		serveServiceGuest(holder.state)
-	end)
-	if not ok then
-		warn("CasinoTycoonGuests: reception guest failed: " .. tostring(err))
+	receptionPending += 1
+	local built, state = pcall(buildServiceGuest, geometry)
+	receptionPending -= 1
+	if not built then
+		warn("CasinoTycoonGuests: reception guest failed: " .. tostring(state))
+		return
 	end
-	cleanupServiceGuest(holder.state)
+	local served, err = pcall(serveServiceGuest, state)
+	if not served then
+		warn("CasinoTycoonGuests: reception service failed: " .. tostring(err))
+	end
+	cleanupServiceGuest(state)
 end
 
 local STATION_TEXT = "RECEPTION DESK\nUPGRADE +15% INCOME"
@@ -854,12 +883,17 @@ local function ensureDeskStation(geometry)
 			flash("PROFILE LOADING - TRY AGAIN", Color3.fromRGB(240, 190, 120), 2)
 			return
 		end
+		if player:GetAttribute("DataReadOnly") == true then
+			-- A read-only profile could take cash that can never be stored.
+			flash("PROFILE READ-ONLY - DESK LOCKED", Color3.fromRGB(240, 190, 120), 2.5)
+			return
+		end
 		local character = player.Character
 		local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
 		if not playerRoot or (playerRoot.Position - body.Position).Magnitude > DESK_MAX_DISTANCE + 2 then
 			return
 		end
-		if (upgradeCooldown[player] or 0) > os.clock() then
+		if (upgradeCooldown[player] or 0) > os.clock() or purchasing[player] then
 			return
 		end
 		local stats = player:FindFirstChild("leaderstats")
@@ -877,29 +911,39 @@ local function ensureDeskStation(geometry)
 			flash("NEED $" .. tostring(cost) .. " FOR DESK " .. tostring(level + 1), Color3.fromRGB(240, 190, 120), 2.5)
 			return
 		end
-		if player:GetAttribute("DataReadOnly") == true then
-			-- A read-only profile would charge cash that can never be saved.
-			flash("PROFILE READ-ONLY - DESK LOCKED", Color3.fromRGB(240, 190, 120), 2.5)
+		if not (Data and Data.PurchaseDeskUpgrade) then
+			-- Without the profile module the money could not be tracked at all.
+			flash("PROFILE UNAVAILABLE - DESK LOCKED", Color3.fromRGB(240, 190, 120), 2.5)
 			return
 		end
-		upgradeCooldown[player] = os.clock() + 1
 
-		-- Charge, then persist. SetDeskLevel clamps to 0..3, refuses downgrades
-		-- and marks the profile dirty so the level survives a rejoin. If the
-		-- write is refused the charge is refunded immediately.
-		cash.Value = math.max(0, cash.Value - cost)
-		local nextLevel = level + 1
-		local stored = true
-		if Data and Data.SetDeskLevel then
-			stored = Data.SetDeskLevel(player, nextLevel)
-		end
-		if stored == false then
-			cash.Value = math.min(RECEPTION_AWARD_CAP, cash.Value + cost)
-			flash("SAVE FAILED - UPGRADE REFUNDED", Color3.fromRGB(240, 190, 120), 2.5)
+		upgradeCooldown[player] = os.clock() + 2
+		purchasing[player] = true
+		-- Charge and write happen inside the data module: cash and DeskLevel go
+		-- out in one payload and the level is granted only after that write is
+		-- confirmed. On failure both the profile field and leaderstats cash are
+		-- restored, so no money is kept without a stored upgrade.
+		local ok, result = Data.PurchaseDeskUpgrade(player, cost, DESK_MAX_LEVEL)
+		purchasing[player] = nil
+		if not ok then
+			if result == "SaveFailed" then
+				flash("SAVE FAILED - NOT CHARGED", Color3.fromRGB(240, 190, 120), 3)
+			elseif result == "NotEnoughCash" then
+				flash("NEED $" .. tostring(cost), Color3.fromRGB(240, 190, 120), 2.5)
+			elseif result == "MaxLevel" then
+				flash("DESK LEVEL MAX", Color3.fromRGB(154, 226, 177), 2)
+			else
+				flash("UPGRADE UNAVAILABLE - TRY AGAIN", Color3.fromRGB(240, 190, 120), 2.5)
+			end
 			return
 		end
-		player:SetAttribute("DeskLevel", nextLevel)
-		flash("DESK LV " .. tostring(nextLevel) .. " UNLOCKED", Color3.fromRGB(154, 226, 177), 2.5)
+		player:SetAttribute("DeskLevel", result)
+		local persistent = Data.IsPersistent and Data.IsPersistent()
+		if persistent then
+			flash("DESK LV " .. tostring(result) .. " SAVED", Color3.fromRGB(154, 226, 177), 2.5)
+		else
+			flash("DESK LV " .. tostring(result) .. " (SESSION ONLY)", Color3.fromRGB(154, 226, 177), 2.5)
+		end
 	end)
 
 	station.PrimaryPart = body
@@ -930,7 +974,7 @@ task.spawn(function()
 			task.wait(RECEPTION_RETRY)
 		else
 			ensureDeskStation(geometry)
-			if #Players:GetPlayers() > 0 and #receptionQueue < QUEUE_SIZE then
+			if #Players:GetPlayers() > 0 and hasQueueCapacity(#receptionQueue, receptionPending, QUEUE_SIZE) then
 				task.spawn(startServiceGuest, geometry)
 				task.wait(RECEPTION_INTERVAL + Random.new():NextNumber(0, RECEPTION_JITTER))
 			else
@@ -943,4 +987,5 @@ end)
 Players.PlayerRemoving:Connect(function(player)
 	serveCooldown[player] = nil
 	upgradeCooldown[player] = nil
+	purchasing[player] = nil
 end)
