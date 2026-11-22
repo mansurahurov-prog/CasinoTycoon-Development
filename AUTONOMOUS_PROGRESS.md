@@ -15,9 +15,10 @@
 Ограничение: DataStore недоступен на локальном .rbxl, работает memory-fallback.
 
 ## Следующие задачи
-2. Игровой луп ставок: конфиг столов, BetRequest/BetResult, выбор ставки, 2 игры, лимиты/кулдауны.
-3. Монетизация: gamepass id, идемпотентные receipt через PurchaseIds.
-4. Leaderboard OrderedDataStore + телеметрия.
+Актуализировано по аудиту Issue #2 (2026-11-22): см. `AUDIT_ISSUE_2.md`.
+2. Игровой луп ставок: базовый автомат уже в `CasinoTycoonSlots` (ставка 50, джекпот 500). Осталось: конфиг столов, BetRequest/BetResult, выбор ставки, лимиты, кулдауны.
+3. Монетизация: каркас в `CasinoTycoonMonetization`/`CasinoTycoonVIPs`, все id в `CasinoTycoonShopConfig` равны 0. Блокер: реальные id после публикации. Первый дефект к исправлению — выдача до загрузки профиля и сохранение `PurchaseIds`.
+4. Leaderboard: работает на `DataStore` `CasinoTycoonBoard_v1` (не `OrderedDataStore`). Осталось: устойчивость к гонкам и телеметрия.
 5. Визуал, NPC, UI/mobile, туториал, удержание, баланс, оптимизация.
 
 ## Изменённые объекты

@@ -2,6 +2,10 @@
 
 Последняя сверка: 2026-11-18. Подключённый Roblox Studio: `Place1`, файл `CasinoTycoon_Backup.rbxl`, режим Edit; не опубликован в облако. Эта заметка основана на предыдущих адресных аудитах и подтверждённом списке Studio, а не на повторном полном аудите.
 
+> **Актуальность (2026-11-22):** заметка описывает срез до Rojo-экспорта и до этапа 1 (`CasinoTycoonData`).
+> Часть утверждений устарела; расхождения перечислены в `AUDIT_ISSUE_2.md`, раздел «Расхождения документации».
+> Текущая Studio-сессия — `CasinoTycoon_before_Rojo_Sync.rbxl`, а не `CasinoTycoon_Backup.rbxl`.
+
 ## Здания и важные координаты
 
 - `Workspace.CasinoTycoon.CentralDistrict.GrandCasinoHotel.MainVolume`: Part 108×25×76, центр (0,16,0), границы X[-54,54], Y[3.5,28.5], Z[-38,38]; Anchored, CanCollide=true, Transparency=0. Основной непрозрачный объём блокирует интерьер.
