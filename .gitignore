@@ -1,7 +1,10 @@
-﻿# Roblox files
+# Roblox files
 *.rbxl
 *.rbxlx
 *.rbxl.lock
+*.rbxlx.lock
+*.rbxm
+*.rbxmx
 *Backup*
 *backup*
 *.bak
@@ -17,6 +20,8 @@ secrets/
 .codex-*/
 .vscode/
 .idea/
+work/
+outputs/
 *.tmp
 *.log
 *.cache
