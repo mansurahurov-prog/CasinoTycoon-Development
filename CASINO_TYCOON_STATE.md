@@ -55,3 +55,12 @@
 3. После крупных этапов обновлять эту заметку; публикацию не выполнять.
 
 MainVolume opening — первый реализованный автономный этап. Изменения сохранены; игра не публиковалась.
+
+## Этап 2026-11-22 — интерактивная стойка регистрации (только код репозитория)
+
+- В `src/ServerScriptService/CasinoTycoonGuests.server.luau` добавлен независимый цикл `RECEPTION_*`: один гость (`HotelReceptionGuest`) раз в ~35–45 с входит в лобби, идёт по центру к стойке и ждёт у `DeskBody` (Point: X=0, Z≈19.8, пол Y=5.5).
+- `ProximityPrompt` (`Hotel Guest` / `Check in guest`, hold 0.8 с, дистанция 12) создаётся на `HumanoidRootPart` только после прибытия гостя к стойке.
+- Награда $60 начисляется один раз: флаг `served` и уничтожение prompt выполняются до изменения `leaderstats.Cash`; сервер дополнительно проверяет `CashLoaded`, дистанцию и per-player cooldown 30 с.
+- Обратная связь: надпись над гостем меняется на `+$60 | CHECK-IN COMPLETE`, у игрока выставляются `LastGuestService=HOTEL CHECK-IN` и `LastGuestReward=60` (тост HUD). Затем гость уходит к входу и удаляется.
+- Существующий цикл `runVisit` для Plot_1–Plot_4 не изменён; общие части аватара и бейджа вынесены в `createGuestAvatar`/`addGuestBadge` с сохранением прежнего вида NPC.
+- Проверено: `loadstring`-компиляция файла в Studio (без запуска), `rojo sourcemap` = 13 Script / 2 ModuleScript / 1 LocalScript, `git diff --check`, UTF-8 без BOM, LF. Runtime-проверка в Play и Studio Sync не выполнялись.
