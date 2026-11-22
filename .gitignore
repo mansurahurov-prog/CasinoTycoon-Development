@@ -1,0 +1,24 @@
+﻿# Roblox files
+*.rbxl
+*.rbxlx
+*.rbxl.lock
+*Backup*
+*backup*
+*.bak
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials/
+secrets/
+# Local files
+.codex/
+.codex-*/
+.vscode/
+.idea/
+*.tmp
+*.log
+*.cache
+Thumbs.db
+.DS_Store
