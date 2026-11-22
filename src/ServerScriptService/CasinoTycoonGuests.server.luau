@@ -923,7 +923,7 @@ local function ensureDeskStation(geometry)
 		-- out in one payload and the level is granted only after that write is
 		-- confirmed. On failure both the profile field and leaderstats cash are
 		-- restored, so no money is kept without a stored upgrade.
-		local ok, result = Data.PurchaseDeskUpgrade(player, cost, DESK_MAX_LEVEL)
+		local ok, result, persisted = Data.PurchaseDeskUpgrade(player, cost, DESK_MAX_LEVEL)
 		purchasing[player] = nil
 		if not ok then
 			if result == "SaveFailed" then
@@ -939,7 +939,11 @@ local function ensureDeskStation(geometry)
 		end
 		player:SetAttribute("DeskLevel", result)
 		local persistent = Data.IsPersistent and Data.IsPersistent()
-		if persistent then
+		if not persisted then
+			-- The write reply was lost: the level is already applied locally and
+			-- the next autosave stores it, so never call this refunded.
+			flash("DESK LV " .. tostring(result) .. " - SAVING...", Color3.fromRGB(240, 190, 120), 3)
+		elseif persistent then
 			flash("DESK LV " .. tostring(result) .. " SAVED", Color3.fromRGB(154, 226, 177), 2.5)
 		else
 			flash("DESK LV " .. tostring(result) .. " (SESSION ONLY)", Color3.fromRGB(154, 226, 177), 2.5)
